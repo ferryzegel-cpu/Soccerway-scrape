@@ -5,18 +5,22 @@ Scrapt spelersstatistieken van alle clubs in de Eredivisie en
 Keuken Kampioen Divisie en slaat ze op als Excel-bestand (één tabblad per club).
 
 Gebruik:
-    python soccerway_squads.py
-    python soccerway_squads.py --output mijn_bestand.xlsx
-    python soccerway_squads.py --competities eredivisie kkd
+    python soccerway_squads.py --api-key JOUW_SCRAPERAPI_KEY
+    python soccerway_squads.py --api-key JOUW_KEY --output mijn_bestand.xlsx
+    python soccerway_squads.py --api-key JOUW_KEY --competities eredivisie
+
+Via GitHub Actions: stel SCRAPERAPI_KEY in als repository secret.
 
 Installeer:
     pip install requests beautifulsoup4 lxml openpyxl
 """
 
 import argparse
+import os
 import re
 import sys
 import time
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,18 +32,18 @@ from openpyxl.utils import get_column_letter
 # Configuratie
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://www.soccerway.com"
+BASE_URL     = "https://www.soccerway.com"
+SCRAPERAPI   = "https://api.scraperapi.com"
 
 COMPETITIES = {
     "eredivisie": {
         "naam": "Eredivisie",
-        # Gebruik de hoofd- én resultaten-pagina voor maximale club-coverage
         "paginas": [
             f"{BASE_URL}/netherlands/eredivisie/",
             f"{BASE_URL}/netherlands/eredivisie/results/",
             f"{BASE_URL}/netherlands/eredivisie/fixtures/",
         ],
-        "kleur": "1E3A5F",
+        "kleur":  "1E3A5F",
         "accent": "FF6B00",
     },
     "kkd": {
@@ -49,7 +53,7 @@ COMPETITIES = {
             f"{BASE_URL}/netherlands/eerste-divisie/results/",
             f"{BASE_URL}/netherlands/eerste-divisie/fixtures/",
         ],
-        "kleur": "2D5016",
+        "kleur":  "2D5016",
         "accent": "FFD700",
     },
 }
@@ -57,18 +61,45 @@ COMPETITIES = {
 KOLOMMEN = ["#", "Naam", "Positie", "Leeftijd", "Wedstrijden", "MIN",
             "Goals", "Assists", "Gele kaarten", "Rode kaarten"]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": BASE_URL + "/",
+# Bekende niet-Nederlandse clubs die in de sidebar staan — uitsluiten
+UITGESLOTEN = {
+    "inter-miami", "al-nassr", "al-ahli", "al-ahli-sc",
+    "messi-lionel", "ronaldo-cristiano",
+    "arsenal", "manchester-city", "manchester-united", "chelsea", "liverpool",
+    "barcelona", "real-madrid", "psg", "bayern-munich", "juventus",
+    "milan", "inter", "borussia-dortmund", "atalanta", "lazio", "napoli",
+    "cremonese", "como", "freiburg", "mainz", "bayer-leverkusen", "dortmund",
+    "brighton", "burnley", "crystal-palace",
+    "betis", "real-salt-lake", "new-england-revolution",
+    "celta-vigo", "alaves", "elche", "angers", "nantes",
+    "atl-madrid",
 }
 
-REQUEST_DELAY = 2
+# Nederlandse clubs die we WILLEN (whitelist voor filtering)
+NL_EREDIVISIE = {
+    "ajax", "psv", "feyenoord", "az-alkmaar", "fc-twente", "twente",
+    "fc-utrecht", "utrecht", "sc-heerenveen", "heerenveen",
+    "nec-nijmegen", "nijmegen", "go-ahead-eagles", "g-a-eagles",
+    "sparta-rotterdam", "pec-zwolle", "zwolle",
+    "fortuna-sittard", "sittard", "fc-groningen", "groningen",
+    "nac-breda", "heracles-almelo", "heracles",
+    "excelsior", "fc-volendam", "telstar",
+    "almere-city", "rkc-waalwijk",
+}
+
+NL_KKD = {
+    "willem-ii", "fc-den-bosch", "den-bosch", "mvv-maastricht", "maastricht",
+    "roda-jc", "roda", "fc-eindhoven", "eindhoven-fc", "de-graafschap",
+    "jong-ajax", "jong-az-alkmaar", "jong-az", "jong-psv",
+    "jong-fc-utrecht", "jong-utrecht",
+    "telstar", "top-oss", "vvv-venlo", "venlo",
+    "fc-dordrecht", "dordrecht", "excelsior",
+    "ado-den-haag", "den-haag", "sc-cambuur", "cambuur",
+    "fc-volendam", "almere-city", "helmond-sport",
+    "fc-emmen", "vitesse", "rkc-waalwijk", "waalwijk",
+}
+
+NL_CLUBS = {"eredivisie": NL_EREDIVISIE, "kkd": NL_KKD}
 
 POSITIE_MAP = {
     "Goalkeepers": "Keeper",
@@ -78,27 +109,40 @@ POSITIE_MAP = {
     "Coach":       "Coach",
 }
 
-# Sidebar-links die we NIET willen meenemen (zijn geen competitie-clubs)
-UITGESLOTEN_SLUGS = {
-    "inter-miami", "al-nassr", "messi-lionel", "ronaldo-cristiano",
-    "arsenal", "manchester-city", "manchester-united", "chelsea",
-    "liverpool", "barcelona", "real-madrid", "psg", "bayern-munich",
-    "juventus", "milan", "inter", "borussia-dortmund",
-}
+# Wedstrijdlink patroon: /match/slug1-HASH1/slug2-HASH2/
+MATCH_RE = re.compile(
+    r"/match/([a-z][a-z0-9-]*)-([A-Za-z0-9]{6,12})/([a-z][a-z0-9-]*)-([A-Za-z0-9]{6,12})/"
+)
 
+REQUEST_DELAY = 3   # seconden — ScraperAPI is sneller dan directe requests
 
 # ---------------------------------------------------------------------------
-# Hulpfuncties
+# ScraperAPI fetch
 # ---------------------------------------------------------------------------
 
-def fetch(url: str, session: requests.Session):
-    try:
-        r = session.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        return BeautifulSoup(r.text, "lxml")
-    except requests.RequestException as e:
-        print(f"  [WAARSCHUWING] {url}: {e}", file=sys.stderr)
-        return None
+def scraper_fetch(url: str, api_key: str, retries: int = 3) -> BeautifulSoup | None:
+    """Haalt een URL op via ScraperAPI en retourneert BeautifulSoup."""
+    params = {
+        "api_key": api_key,
+        "url":     url,
+        "country_code": "nl",   # Nederlandse IP → minder kans op blokkering
+    }
+    for poging in range(1, retries + 1):
+        try:
+            r = requests.get(SCRAPERAPI, params=params, timeout=70)
+            if r.status_code == 200:
+                return BeautifulSoup(r.text, "lxml")
+            elif r.status_code == 500:
+                # ScraperAPI geeft 500 bij tijdelijke fouten, opnieuw proberen
+                print(f"    [retry {poging}/{retries}] status 500...", end=" ")
+                time.sleep(5)
+            else:
+                print(f"  [WAARSCHUWING] {url} → HTTP {r.status_code}", file=sys.stderr)
+                return None
+        except requests.RequestException as e:
+            print(f"  [WAARSCHUWING] {url}: {e}", file=sys.stderr)
+            time.sleep(5)
+    return None
 
 
 def clean(text: str) -> str:
@@ -108,98 +152,60 @@ def clean(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Club-hashes extraheren uit wedstrijdlinks
 # ---------------------------------------------------------------------------
-# Soccerway laadt de standentabel via JS, maar de wedstrijdlinks in de
-# fixtures/results-sectie staan WEL in de plain HTML.
-# Een wedstrijdlink ziet er zo uit:
-#   /match/ajax-8UOvIwnb/psv-M9UEHJWi/
-#   /match/feyenoord-8zjySeoN/twente-dhOKTHGA/
-# We extraheren de slug+hash van beide teams uit elke match-URL.
 
-MATCH_RE = re.compile(
-    r"/match/([a-z0-9-]+)-([A-Za-z0-9]{6,12})/([a-z0-9-]+)-([A-Za-z0-9]{6,12})/"
-)
-
-
-def haal_clubs_op(comp_key: str, session: requests.Session) -> list:
-    """
-    Haalt alle unieke clubs op door wedstrijdlinks te parsen van de
-    competitie- en fixtures/results-pagina's.
-    """
+def haal_clubs_op(comp_key: str, api_key: str) -> list:
     cfg = COMPETITIES[comp_key]
-    gevonden = {}  # hash -> (slug, naam)
+    whitelist = NL_CLUBS[comp_key]
+    gevonden = {}   # hash → slug
 
     for pagina_url in cfg["paginas"]:
         print(f"  Scannen: {pagina_url}")
-        soup = fetch(pagina_url, session)
+        soup = scraper_fetch(pagina_url, api_key)
         if not soup:
             continue
 
-        # Methode 1: /match/slug1-HASH1/slug2-HASH2/ links
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            m = MATCH_RE.search(href)
+            m = MATCH_RE.search(a["href"])
             if m:
                 slug1, hash1, slug2, hash2 = m.groups()
                 for slug, hsh in [(slug1, hash1), (slug2, hash2)]:
-                    if slug not in UITGESLOTEN_SLUGS and hsh not in gevonden:
+                    if hsh not in gevonden and slug in whitelist:
                         gevonden[hsh] = slug
 
-        time.sleep(1)
+        time.sleep(REQUEST_DELAY)
 
-    if not gevonden:
-        print(f"  [FOUT] Geen clubs gevonden voor {cfg['naam']}", file=sys.stderr)
-        return []
-
-    # Zet hashes om naar (naam, squad-URL) paren
-    # De naam halen we op van de squad-pagina zelf
     clubs = []
     for hsh, slug in gevonden.items():
         squad_url = f"{BASE_URL}/team/{slug}/{hsh}/squad/"
-        # Maak leesbare naam van slug (koppeltekens → spaties, hoofdletters)
         naam = slug.replace("-", " ").title()
         clubs.append((naam, squad_url))
 
-    # Sorteer op naam
     clubs.sort(key=lambda x: x[0])
     print(f"  {len(clubs)} club(s) gevonden: {', '.join(n for n, _ in clubs)}")
     return clubs
 
 
 # ---------------------------------------------------------------------------
-# Echte clubnaam ophalen van de squad-pagina
-# ---------------------------------------------------------------------------
-
-def haal_clubnaam_op(soup: BeautifulSoup) -> str:
-    """Probeert de echte clubnaam te lezen van de squad-pagina."""
-    # Soccerway zet de naam in de page-title of in een h1
-    for selector in ["div.page-title h1", "h1.headline", "h1"]:
-        tag = soup.select_one(selector)
-        if tag:
-            naam = clean(tag.get_text())
-            # Verwijder " - Squad" achtervoegsel indien aanwezig
-            naam = re.sub(r"\s*[-–]\s*Squad.*$", "", naam, flags=re.IGNORECASE)
-            if naam and len(naam) > 1:
-                return naam
-
-    # Fallback: zoek in <title>
-    title = soup.find("title")
-    if title:
-        t = clean(title.get_text())
-        # "Ajax - Squad - Soccerway" → "Ajax"
-        parts = re.split(r"\s*[-–|]\s*", t)
-        if parts:
-            return parts[0].strip()
-
-    return ""
-
-
-# ---------------------------------------------------------------------------
 # Spelersdata scrapen
 # ---------------------------------------------------------------------------
 
-def scrape_squad(url: str, session: requests.Session) -> tuple:
-    """Geeft (clubnaam, lijst_van_spelers) terug."""
-    soup = fetch(url, session)
+def haal_clubnaam_op(soup: BeautifulSoup) -> str:
+    for sel in ["div.page-title h1", "h1"]:
+        tag = soup.select_one(sel)
+        if tag:
+            naam = clean(re.sub(r"\s*[-–]\s*Squad.*", "", tag.get_text(), flags=re.I))
+            if naam and len(naam) > 1:
+                return naam
+    title = soup.find("title")
+    if title:
+        parts = re.split(r"\s*[-–|]\s*", clean(title.get_text()))
+        if parts:
+            return parts[0].strip()
+    return ""
+
+
+def scrape_squad(url: str, api_key: str) -> tuple:
+    soup = scraper_fetch(url, api_key)
     if not soup:
         return "", []
 
@@ -225,9 +231,7 @@ def scrape_squad(url: str, session: requests.Session) -> tuple:
         def td(i):
             return clean(tds[i].get_text()) if i < len(tds) else "-"
 
-        naam_td = tds[1] if len(tds) > 1 else None
-        if not naam_td:
-            continue
+        naam_td = tds[1]
         a_tag = naam_td.find("a")
         naam = clean(a_tag.get_text() if a_tag else naam_td.get_text())
 
@@ -258,17 +262,17 @@ def scrape_squad(url: str, session: requests.Session) -> tuple:
 # ---------------------------------------------------------------------------
 
 def maak_border():
-    thin = Side(style="thin", color="CCCCCC")
-    return Border(left=thin, right=thin, top=thin, bottom=thin)
+    s = Side(style="thin", color="CCCCCC")
+    return Border(left=s, right=s, top=s, bottom=s)
 
 
-def schrijf_tabblad(wb, clubnaam, comp_cfg, spelers, tab_kleur):
-    tab_naam = re.sub(r"[/\\?*:\[\]]", "", clubnaam)[:31]
-    if tab_naam in [ws.title for ws in wb.worksheets]:
-        tab_naam = tab_naam[:28] + " (2)"
+def schrijf_tabblad(wb, clubnaam, comp_cfg, spelers):
+    tab = re.sub(r"[/\\?*:\[\]]", "", clubnaam)[:31]
+    if tab in [ws.title for ws in wb.worksheets]:
+        tab = tab[:28] + " (2)"
 
-    ws = wb.create_sheet(title=tab_naam)
-    ws.sheet_properties.tabColor = tab_kleur
+    ws = wb.create_sheet(title=tab)
+    ws.sheet_properties.tabColor = comp_cfg["kleur"]
     border = maak_border()
 
     ws.merge_cells("A1:J1")
@@ -284,33 +288,29 @@ def schrijf_tabblad(wb, clubnaam, comp_cfg, spelers, tab_kleur):
     ws["A2"].fill = PatternFill("solid", start_color=comp_cfg["accent"])
     ws["A2"].alignment = Alignment(horizontal="center")
 
-    for col, kol_naam in enumerate(KOLOMMEN, start=1):
-        cel = ws.cell(row=3, column=col, value=kol_naam)
-        cel.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        cel.fill = PatternFill("solid", start_color="2C3E50")
-        cel.alignment = Alignment(horizontal="center")
-        cel.border = border
+    for col, h in enumerate(KOLOMMEN, 1):
+        c = ws.cell(row=3, column=col, value=h)
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", start_color="2C3E50")
+        c.alignment = Alignment(horizontal="center")
+        c.border = border
 
-    pos_kleur = {
-        "Keeper": "E8F4FD", "Verdediger": "E8F8E8",
-        "Middenvelder": "FFF8E1", "Aanvaller": "FDE8E8", "Onbekend": "F5F5F5",
-    }
-    for rij_idx, speler in enumerate(spelers, start=4):
-        vul = PatternFill("solid", start_color=pos_kleur.get(speler.get("Positie", "Onbekend"), "FFFFFF"))
-        for col, kol_naam in enumerate(KOLOMMEN, start=1):
-            cel = ws.cell(row=rij_idx, column=col, value=speler.get(kol_naam, "-"))
-            cel.font = Font(name="Arial", size=10)
-            cel.fill = vul
-            cel.border = border
-            cel.alignment = Alignment(horizontal="center" if col != 2 else "left")
+    pk = {"Keeper":"E8F4FD","Verdediger":"E8F8E8","Middenvelder":"FFF8E1","Aanvaller":"FDE8E8","Onbekend":"F5F5F5"}
+    for ri, sp in enumerate(spelers, 4):
+        vul = PatternFill("solid", start_color=pk.get(sp.get("Positie","Onbekend"),"FFFFFF"))
+        for col, h in enumerate(KOLOMMEN, 1):
+            c = ws.cell(row=ri, column=col, value=sp.get(h,"-"))
+            c.font = Font(name="Arial", size=10)
+            c.fill = vul
+            c.border = border
+            c.alignment = Alignment(horizontal="center" if col != 2 else "left")
 
-    for i, b in enumerate([6, 30, 16, 10, 14, 8, 8, 9, 14, 13], start=1):
+    for i, b in enumerate([6,30,16,10,14,8,8,9,14,13], 1):
         ws.column_dimensions[get_column_letter(i)].width = b
-
     ws.freeze_panes = "A4"
 
 
-def maak_overzicht_tab(wb, club_data):
+def maak_overzicht(wb, data):
     ws = wb.active
     ws.title = "Overzicht"
     ws.sheet_properties.tabColor = "1A1A2E"
@@ -322,27 +322,23 @@ def maak_overzicht_tab(wb, club_data):
     ws["A1"].alignment = Alignment(horizontal="center")
     ws.row_dimensions[1].height = 28
 
-    for col, h in enumerate(["Club", "Competitie", "Spelers", "Tabblad"], 1):
-        cel = ws.cell(row=2, column=col, value=h)
-        cel.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        cel.fill = PatternFill("solid", start_color="2C3E50")
-        cel.alignment = Alignment(horizontal="center")
+    for col, h in enumerate(["Club","Competitie","Spelers","Tabblad"], 1):
+        c = ws.cell(row=2, column=col, value=h)
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", start_color="2C3E50")
+        c.alignment = Alignment(horizontal="center")
 
-    for rij, info in enumerate(club_data, start=3):
-        ws.cell(rij, 1, info["club"]).font = Font(name="Arial", size=10)
-        ws.cell(rij, 2, info["competitie"]).font = Font(name="Arial", size=10)
-        cel_n = ws.cell(rij, 3, info["aantal"])
-        cel_n.font = Font(name="Arial", size=10)
-        cel_n.alignment = Alignment(horizontal="center")
-        ws.cell(rij, 4, info["tab"]).font = Font(name="Arial", size=10)
-        if rij % 2 == 0:
-            for col in range(1, 5):
-                ws.cell(rij, col).fill = PatternFill("solid", start_color="F0F4FF")
+    for ri, d in enumerate(data, 3):
+        ws.cell(ri,1,d["club"]).font   = Font(name="Arial",size=10)
+        ws.cell(ri,2,d["comp"]).font   = Font(name="Arial",size=10)
+        c = ws.cell(ri,3,d["aantal"]); c.font=Font(name="Arial",size=10); c.alignment=Alignment(horizontal="center")
+        ws.cell(ri,4,d["tab"]).font    = Font(name="Arial",size=10)
+        if ri % 2 == 0:
+            for col in range(1,5):
+                ws.cell(ri,col).fill = PatternFill("solid",start_color="F0F4FF")
 
-    ws.column_dimensions["A"].width = 28
-    ws.column_dimensions["B"].width = 28
-    ws.column_dimensions["C"].width = 10
-    ws.column_dimensions["D"].width = 28
+    for col, w in zip("ABCD",[28,28,10,28]):
+        ws.column_dimensions[col].width = w
 
 
 # ---------------------------------------------------------------------------
@@ -350,18 +346,24 @@ def maak_overzicht_tab(wb, club_data):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Soccerway squad scraper → Excel")
-    parser.add_argument("--output", "-o", default="nederland_voetbal_squads.xlsx")
-    parser.add_argument("--competities", "-c", nargs="+",
-                        choices=["eredivisie", "kkd"], default=["eredivisie", "kkd"])
-    parser.add_argument("--vertraging", "-v", type=float, default=REQUEST_DELAY)
+    parser = argparse.ArgumentParser(description="Soccerway squad scraper → Excel via ScraperAPI")
+    parser.add_argument("--api-key",  "-k", default=os.getenv("SCRAPERAPI_KEY"),
+                        help="ScraperAPI sleutel (of stel SCRAPERAPI_KEY omgevingsvariabele in)")
+    parser.add_argument("--output",   "-o", default="nederland_voetbal_squads.xlsx")
+    parser.add_argument("--competities","-c", nargs="+",
+                        choices=["eredivisie","kkd"], default=["eredivisie","kkd"])
     args = parser.parse_args()
 
-    session = requests.Session()
-    wb = Workbook()
-    club_data_overzicht = []
+    if not args.api_key:
+        print("FOUT: geen ScraperAPI key opgegeven.\n"
+              "Gebruik --api-key JOUW_KEY of stel de SCRAPERAPI_KEY omgevingsvariabele in.",
+              file=sys.stderr)
+        sys.exit(1)
 
-    print(f"\nSoccerway Squad Scraper")
+    wb = Workbook()
+    overzicht = []
+
+    print(f"\nSoccerway Squad Scraper (via ScraperAPI)")
     print("=" * 50)
     print(f"Output: {args.output}\n")
 
@@ -369,41 +371,37 @@ def main():
         cfg = COMPETITIES[comp_key]
         print(f"\n▶ {cfg['naam']}")
 
-        clubs = haal_clubs_op(comp_key, session)
-        time.sleep(args.vertraging)
-
+        clubs = haal_clubs_op(comp_key, args.api_key)
         if not clubs:
-            print(f"  [OVERGESLAGEN] Geen clubs gevonden")
+            print("  [OVERGESLAGEN] Geen clubs gevonden")
             continue
 
         print(f"\n  Squads scrapen ({len(clubs)} clubs):")
-        for i, (clubnaam_slug, url) in enumerate(clubs, 1):
-            print(f"  [{i}/{len(clubs)}] {clubnaam_slug} ...", end=" ", flush=True)
-
-            echte_naam, spelers = scrape_squad(url, session)
-            clubnaam = echte_naam if echte_naam else clubnaam_slug
+        for i, (naam_slug, url) in enumerate(clubs, 1):
+            print(f"  [{i}/{len(clubs)}] {naam_slug} ...", end=" ", flush=True)
+            echte_naam, spelers = scrape_squad(url, args.api_key)
+            clubnaam = echte_naam or naam_slug
 
             if spelers:
-                schrijf_tabblad(wb, clubnaam, cfg, spelers, cfg["kleur"])
-                print(f"✓ {len(spelers)} spelers  ({clubnaam})")
+                schrijf_tabblad(wb, clubnaam, cfg, spelers)
+                print(f"✓ {len(spelers)} spelers")
             else:
-                print(f"⚠ Geen data")
+                print("⚠ Geen data")
 
-            club_data_overzicht.append({
-                "club":       clubnaam,
-                "competitie": cfg["naam"],
-                "aantal":     len(spelers),
-                "tab":        re.sub(r"[/\\?*:\[\]]", "", clubnaam)[:31],
+            overzicht.append({
+                "club":   clubnaam,
+                "comp":   cfg["naam"],
+                "aantal": len(spelers),
+                "tab":    re.sub(r"[/\\?*:\[\]]","",clubnaam)[:31],
             })
 
             if i < len(clubs):
-                time.sleep(args.vertraging)
+                time.sleep(REQUEST_DELAY)
 
-    maak_overzicht_tab(wb, club_data_overzicht)
+    maak_overzicht(wb, overzicht)
     wb.save(args.output)
-
-    totaal = sum(d["aantal"] for d in club_data_overzicht)
-    print(f"\n{'=' * 50}")
+    totaal = sum(d["aantal"] for d in overzicht)
+    print(f"\n{'='*50}")
     print(f"✓ Opgeslagen: {args.output}")
     print(f"  {len(wb.worksheets)} tabbladen  |  {totaal} spelers totaal")
 
