@@ -4,14 +4,12 @@ Soccerway Dutch Leagues Squad Scraper
 Scrapt spelersstatistieken van alle clubs in de Eredivisie en
 Keuken Kampioen Divisie en slaat ze op als Excel-bestand (één tabblad per club).
 
-Club-URL's worden automatisch opgehaald van de competitiestandenpagina's.
-
 Gebruik:
     python soccerway_squads.py
     python soccerway_squads.py --output mijn_bestand.xlsx
     python soccerway_squads.py --competities eredivisie kkd
 
-Installeer benodigdheden:
+Installeer:
     pip install requests beautifulsoup4 lxml openpyxl
 """
 
@@ -35,13 +33,22 @@ BASE_URL = "https://www.soccerway.com"
 COMPETITIES = {
     "eredivisie": {
         "naam": "Eredivisie",
-        "standings_url": f"{BASE_URL}/netherlands/eredivisie/standings/",
+        # Gebruik de hoofd- én resultaten-pagina voor maximale club-coverage
+        "paginas": [
+            f"{BASE_URL}/netherlands/eredivisie/",
+            f"{BASE_URL}/netherlands/eredivisie/results/",
+            f"{BASE_URL}/netherlands/eredivisie/fixtures/",
+        ],
         "kleur": "1E3A5F",
         "accent": "FF6B00",
     },
     "kkd": {
         "naam": "Keuken Kampioen Divisie",
-        "standings_url": f"{BASE_URL}/netherlands/eerste-divisie/standings/",
+        "paginas": [
+            f"{BASE_URL}/netherlands/eerste-divisie/",
+            f"{BASE_URL}/netherlands/eerste-divisie/results/",
+            f"{BASE_URL}/netherlands/eerste-divisie/fixtures/",
+        ],
         "kleur": "2D5016",
         "accent": "FFD700",
     },
@@ -71,6 +78,14 @@ POSITIE_MAP = {
     "Coach":       "Coach",
 }
 
+# Sidebar-links die we NIET willen meenemen (zijn geen competitie-clubs)
+UITGESLOTEN_SLUGS = {
+    "inter-miami", "al-nassr", "messi-lionel", "ronaldo-cristiano",
+    "arsenal", "manchester-city", "manchester-united", "chelsea",
+    "liverpool", "barcelona", "real-madrid", "psg", "bayern-munich",
+    "juventus", "milan", "inter", "borussia-dortmund",
+}
+
 
 # ---------------------------------------------------------------------------
 # Hulpfuncties
@@ -91,67 +106,104 @@ def clean(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Club-URL's automatisch ophalen
+# Club-hashes extraheren uit wedstrijdlinks
 # ---------------------------------------------------------------------------
+# Soccerway laadt de standentabel via JS, maar de wedstrijdlinks in de
+# fixtures/results-sectie staan WEL in de plain HTML.
+# Een wedstrijdlink ziet er zo uit:
+#   /match/ajax-8UOvIwnb/psv-M9UEHJWi/
+#   /match/feyenoord-8zjySeoN/twente-dhOKTHGA/
+# We extraheren de slug+hash van beide teams uit elke match-URL.
+
+MATCH_RE = re.compile(
+    r"/match/([a-z0-9-]+)-([A-Za-z0-9]{6,12})/([a-z0-9-]+)-([A-Za-z0-9]{6,12})/"
+)
+
 
 def haal_clubs_op(comp_key: str, session: requests.Session) -> list:
     """
-    Haalt club-URLs op via de soccerway standenspagina.
-    Zoekt naar alle /team/slug/hash/ links op de pagina.
+    Haalt alle unieke clubs op door wedstrijdlinks te parsen van de
+    competitie- en fixtures/results-pagina's.
     """
     cfg = COMPETITIES[comp_key]
-    url = cfg["standings_url"]
-    print(f"  Clublijst ophalen: {url}")
+    gevonden = {}  # hash -> (slug, naam)
 
-    soup = fetch(url, session)
-    if not soup:
+    for pagina_url in cfg["paginas"]:
+        print(f"  Scannen: {pagina_url}")
+        soup = fetch(pagina_url, session)
+        if not soup:
+            continue
+
+        # Methode 1: /match/slug1-HASH1/slug2-HASH2/ links
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            m = MATCH_RE.search(href)
+            if m:
+                slug1, hash1, slug2, hash2 = m.groups()
+                for slug, hsh in [(slug1, hash1), (slug2, hash2)]:
+                    if slug not in UITGESLOTEN_SLUGS and hsh not in gevonden:
+                        gevonden[hsh] = slug
+
+        time.sleep(1)
+
+    if not gevonden:
+        print(f"  [FOUT] Geen clubs gevonden voor {cfg['naam']}", file=sys.stderr)
         return []
 
+    # Zet hashes om naar (naam, squad-URL) paren
+    # De naam halen we op van de squad-pagina zelf
     clubs = []
-    gezien = set()
+    for hsh, slug in gevonden.items():
+        squad_url = f"{BASE_URL}/team/{slug}/{hsh}/squad/"
+        # Maak leesbare naam van slug (koppeltekens → spaties, hoofdletters)
+        naam = slug.replace("-", " ").title()
+        clubs.append((naam, squad_url))
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Soccerway team-links: /team/naam/HASH/ (hash = 8 alfanumerieke tekens)
-        m = re.search(r"/team/([^/]+)/([A-Za-z0-9]{6,10})/?$", href)
-        if m:
-            slug, hsh = m.group(1), m.group(2)
-            squad_url = f"{BASE_URL}/team/{slug}/{hsh}/squad/"
-            naam = clean(a.get_text())
-            if squad_url not in gezien and naam and len(naam) > 1 and not naam.isdigit():
-                gezien.add(squad_url)
-                clubs.append((naam, squad_url))
-
-    # Fallback: probeer de transfers-pagina als standenpagina leeg is
-    if not clubs:
-        fallback = url.replace("/standings/", "/transfers/")
-        print(f"  Geen clubs via standings, probeer: {fallback}", file=sys.stderr)
-        soup2 = fetch(fallback, session)
-        if soup2:
-            for a in soup2.find_all("a", href=True):
-                href = a["href"]
-                m = re.search(r"/team/([^/]+)/([A-Za-z0-9]{6,10})/?$", href)
-                if m:
-                    slug, hsh = m.group(1), m.group(2)
-                    squad_url = f"{BASE_URL}/team/{slug}/{hsh}/squad/"
-                    naam = clean(a.get_text())
-                    if squad_url not in gezien and naam and len(naam) > 1 and not naam.isdigit():
-                        gezien.add(squad_url)
-                        clubs.append((naam, squad_url))
-
-    print(f"  {len(clubs)} club(s) gevonden")
+    # Sorteer op naam
+    clubs.sort(key=lambda x: x[0])
+    print(f"  {len(clubs)} club(s) gevonden: {', '.join(n for n, _ in clubs)}")
     return clubs
+
+
+# ---------------------------------------------------------------------------
+# Echte clubnaam ophalen van de squad-pagina
+# ---------------------------------------------------------------------------
+
+def haal_clubnaam_op(soup: BeautifulSoup) -> str:
+    """Probeert de echte clubnaam te lezen van de squad-pagina."""
+    # Soccerway zet de naam in de page-title of in een h1
+    for selector in ["div.page-title h1", "h1.headline", "h1"]:
+        tag = soup.select_one(selector)
+        if tag:
+            naam = clean(tag.get_text())
+            # Verwijder " - Squad" achtervoegsel indien aanwezig
+            naam = re.sub(r"\s*[-–]\s*Squad.*$", "", naam, flags=re.IGNORECASE)
+            if naam and len(naam) > 1:
+                return naam
+
+    # Fallback: zoek in <title>
+    title = soup.find("title")
+    if title:
+        t = clean(title.get_text())
+        # "Ajax - Squad - Soccerway" → "Ajax"
+        parts = re.split(r"\s*[-–|]\s*", t)
+        if parts:
+            return parts[0].strip()
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
 # Spelersdata scrapen
 # ---------------------------------------------------------------------------
 
-def scrape_squad(url: str, session: requests.Session) -> list:
+def scrape_squad(url: str, session: requests.Session) -> tuple:
+    """Geeft (clubnaam, lijst_van_spelers) terug."""
     soup = fetch(url, session)
     if not soup:
-        return []
+        return "", []
 
+    clubnaam = haal_clubnaam_op(soup)
     spelers = []
     current_positie = "Onbekend"
 
@@ -198,7 +250,7 @@ def scrape_squad(url: str, session: requests.Session) -> list:
         except (IndexError, AttributeError):
             continue
 
-    return spelers
+    return clubnaam, spelers
 
 
 # ---------------------------------------------------------------------------
@@ -325,15 +377,17 @@ def main():
             continue
 
         print(f"\n  Squads scrapen ({len(clubs)} clubs):")
-        for i, (clubnaam, url) in enumerate(clubs, 1):
-            print(f"  [{i}/{len(clubs)}] {clubnaam} ...", end=" ", flush=True)
-            spelers = scrape_squad(url, session)
+        for i, (clubnaam_slug, url) in enumerate(clubs, 1):
+            print(f"  [{i}/{len(clubs)}] {clubnaam_slug} ...", end=" ", flush=True)
+
+            echte_naam, spelers = scrape_squad(url, session)
+            clubnaam = echte_naam if echte_naam else clubnaam_slug
 
             if spelers:
                 schrijf_tabblad(wb, clubnaam, cfg, spelers, cfg["kleur"])
-                print(f"✓ {len(spelers)} spelers")
+                print(f"✓ {len(spelers)} spelers  ({clubnaam})")
             else:
-                print("⚠ Geen data")
+                print(f"⚠ Geen data")
 
             club_data_overzicht.append({
                 "club":       clubnaam,
