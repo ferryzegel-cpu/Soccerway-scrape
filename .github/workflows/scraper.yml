@@ -1,0 +1,35 @@
+name: Scrape Dutch Football Squads
+
+on:
+  # Handmatig starten via de GitHub website
+  workflow_dispatch:
+
+  # Of automatisch elke maandag om 06:00
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Code ophalen
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python instellen
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Packages installeren
+        run: pip install -r requirements.txt
+
+      - name: ⚽ Scraper uitvoeren
+        run: python soccerway_squads.py --output squads.xlsx
+
+      - name: 💾 Excel opslaan als artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nederland-voetbal-squads
+          path: squads.xlsx
+          retention-days: 30
