@@ -120,24 +120,35 @@ REQUEST_DELAY = 3   # seconden — ScraperAPI is sneller dan directe requests
 # ScraperAPI fetch
 # ---------------------------------------------------------------------------
 
-def scraper_fetch(url: str, api_key: str, retries: int = 3) -> BeautifulSoup | None:
+def scraper_fetch(url: str, api_key: str, retries: int = 3,
+                  render: bool = False) -> BeautifulSoup | None:
     """Haalt een URL op via ScraperAPI en retourneert BeautifulSoup."""
     params = {
-        "api_key": api_key,
-        "url":     url,
-        "country_code": "nl",   # Nederlandse IP → minder kans op blokkering
+        "api_key":      api_key,
+        "url":          url,
+        "country_code": "nl",
+        "follow_redirect": "true",
     }
+    if render:
+        params["render"] = "true"
+
     for poging in range(1, retries + 1):
         try:
             r = requests.get(SCRAPERAPI, params=params, timeout=70)
             if r.status_code == 200:
-                return BeautifulSoup(r.text, "lxml")
+                soup = BeautifulSoup(r.text, "lxml")
+                has_table = bool(soup.select_one("table.statistics"))
+                has_gk    = "Goalkeepers" in r.text
+                if not has_table and not has_gk:
+                    # Log eerste 300 tekens zodat we zien wat er terugkomt
+                    preview = r.text[:300].replace("\n"," ")
+                    print(f"\n    [debug] geen data. Preview: {preview[:200]}")
+                return soup
             elif r.status_code == 500:
-                # ScraperAPI geeft 500 bij tijdelijke fouten, opnieuw proberen
-                print(f"    [retry {poging}/{retries}] status 500...", end=" ")
+                print(f"    [retry {poging}/{retries}] status 500...", end=" ", flush=True)
                 time.sleep(5)
             else:
-                print(f"  [WAARSCHUWING] {url} → HTTP {r.status_code}", file=sys.stderr)
+                print(f"  [WAARSCHUWING] HTTP {r.status_code} voor {url}", file=sys.stderr)
                 return None
         except requests.RequestException as e:
             print(f"  [WAARSCHUWING] {url}: {e}", file=sys.stderr)
@@ -160,7 +171,7 @@ def haal_clubs_op(comp_key: str, api_key: str) -> list:
 
     for pagina_url in cfg["paginas"]:
         print(f"  Scannen: {pagina_url}")
-        soup = scraper_fetch(pagina_url, api_key)
+        soup = scraper_fetch(pagina_url, api_key, render=True)
         if not soup:
             continue
 
@@ -205,7 +216,13 @@ def haal_clubnaam_op(soup: BeautifulSoup) -> str:
 
 
 def scrape_squad(url: str, api_key: str) -> tuple:
-    soup = scraper_fetch(url, api_key)
+    # Probeer eerst zonder render (goedkoper, 1 credit)
+    soup = scraper_fetch(url, api_key, render=False)
+
+    # Als er geen tabel is, probeer met JS-rendering (2 credits maar werkt bij JS-sites)
+    if soup and not soup.select_one("table.statistics") and "Goalkeepers" not in soup.get_text():
+        print(f"    [render=true]", end=" ", flush=True)
+        soup = scraper_fetch(url, api_key, render=True)
     if not soup:
         return "", []
 
