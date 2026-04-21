@@ -1,12 +1,9 @@
 name: Scrape Dutch Football Squads
 
 on:
-  # Handmatig starten via de GitHub website
   workflow_dispatch:
-
-  # Of automatisch elke maandag om 06:00
   schedule:
-    - cron: "0 6 * * 1"
+    - cron: "0 6 * * 1"   # elke maandag 06:00
 
 jobs:
   scrape:
@@ -22,9 +19,11 @@ jobs:
           python-version: "3.11"
 
       - name: 📦 Packages installeren
-        run: pip install -r requirements.txt
+        run: pip install requests beautifulsoup4 lxml openpyxl
 
       - name: ⚽ Scraper uitvoeren
+        env:
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
         run: python soccerway_squads.py --output squads.xlsx
 
       - name: 💾 Excel opslaan als artifact
